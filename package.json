@@ -1,0 +1,28 @@
+{
+  "name": "report-web-dashboard-skill",
+  "version": "1.0.0",
+  "description": "report-web-dashboard — an agent skill that turns a technical report plus its artifact tree into one self-contained interactive index.html, and webui, a global HTTP daemon that mounts every project's dashboard under its own URL path prefix on a single port",
+  "bin": {
+    "report-web-dashboard-skill": "bin/install.js"
+  },
+  "files": [
+    "bin",
+    "skill",
+    "README.md"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agent",
+    "skill",
+    "dashboard",
+    "report",
+    "webui",
+    "http-server",
+    "static-hosting"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

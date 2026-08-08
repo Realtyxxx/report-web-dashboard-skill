@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+"""
+webui — global multiplexing dashboard HTTP service.
+
+Replaces the old one-process-per-project 'scripts/server.sh' pattern (one
+python3 -m http.server per project, one port each in 8800-8899) with ONE
+global daemon + ONE global 'webui' command. Every registered project is
+mounted at a URL PATH PREFIX: http://<host>:8800/<name>/
+
+Stdlib only. Single file. See report-web-dashboard skill for context.
+
+CLI:
+  webui register [PATH] [--name NAME] [--force] [--build]
+  webui unregister NAME
+  webui list [--json]
+  webui prune
+  webui start   [--port P] [--bind B] [--force]
+  webui run     [--port P] [--bind B]
+  webui stop [--force] | webui restart [...] | webui status
+  webui url NAME
+  webui open NAME
+  webui _serve --port P --bind B      # internal; spawned by start / called by run
+
+Testability: honor an optional WEBUI_HOME env var. When set, config and state
+live under $WEBUI_HOME/config and $WEBUI_HOME/state instead of the XDG
+defaults (~/.config/webui, ~/.local/state/webui). Resolved at call time in
+every function below — never cached as a module-level constant — so each
+subprocess invocation with a different WEBUI_HOME lands in the right place.
+"""
+
+import argparse
+import datetime
+import email.utils
+import html
+import json
+import logging
+import logging.handlers
+import os
+import posixpath
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_PORT = 8800
+DEFAULT_BIND = "0.0.0.0"
+
+NAME_RE = re.compile(r'[^A-Za-z0-9._-]')
+_RESERVED_NAMES = ('', '.', '..')
+
+BLOCKED_SENTINEL = '.webui-blocked-request'
+
+
+# --------------------------------------------------------------------------
+# Name normalization
+# --------------------------------------------------------------------------
+
+def normalize_name(name):
+    """Substitute anything outside [A-Za-z0-9._-] with '_'. '.' is
+    deliberately preserved (RFC 3986 unreserved, no encoding needed, and
+    it's the URL segment for projects whose name contains a dot). Reject
+    '', '.', '..' both before and after substitution."""
+    if name in _RESERVED_NAMES:
+        raise ValueError(f"invalid name: {name!r}")
+    normalized = NAME_RE.sub('_', name)
+    if normalized in _RESERVED_NAMES:
+        raise ValueError(f"invalid name: {name!r} normalizes to {normalized!r}")
+    return normalized
+
+
+# --------------------------------------------------------------------------
+# Path resolution — call-time, never import-time constants (WEBUI_HOME hook)
+# --------------------------------------------------------------------------
+
+def config_dir():
+    home = os.environ.get('WEBUI_HOME')
+    if home:
+        return os.path.join(home, 'config')
+    return os.path.join(os.path.expanduser('~'), '.config', 'webui')
+
+
+def state_dir():
+    home = os.environ.get('WEBUI_HOME')
+    if home:
+        return os.path.join(home, 'state')
+    return os.path.join(os.path.expanduser('~'), '.local', 'state', 'webui')
+
+
+def registry_path():
+    return os.path.join(config_dir(), 'registry.tsv')
+
+
+def pid_path():
+    return os.path.join(state_dir(), 'webui.pid')
+
+
+def json_state_path():
+    return os.path.join(state_dir(), 'webui.json')
+
+
+def log_path():
+    return os.path.join(state_dir(), 'webui.log')
+
+
+# --------------------------------------------------------------------------
+# Registry read/write
+# --------------------------------------------------------------------------
+
+def read_registry(path):
+    """Skip blank lines, '#' comments, and malformed lines (column count
+    != 2) with a warning rather than crashing."""
+    entries = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return {}
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.rstrip('\n')
+        if not line.strip():
+            continue
+        if line.lstrip().startswith('#'):
+            continue
+        cols = line.split('\t')
+        if len(cols) != 2:
+            print(f"webui: warning: {path} line {lineno}: malformed "
+                  f"(expected 2 tab-separated columns), skipping", file=sys.stderr)
+            continue
+        name, dirpath = cols[0].strip(), cols[1].strip()
+        if not name or not dirpath:
+            print(f"webui: warning: {path} line {lineno}: empty field, skipping",
+                  file=sys.stderr)
+            continue
+        if name in _RESERVED_NAMES or NAME_RE.search(name):
+            # Same rule cmd_register enforces via normalize_name, applied
+            # here too so a tampered/hand-edited registry.tsv can't hand
+            # the live HTTP router a route the CLI would have refused to
+            # create (e.g. a literal '..' name).
+            print(f"webui: warning: {path} line {lineno}: invalid name {name!r}, skipping",
+                  file=sys.stderr)
+            continue
+        entries[name] = dirpath
+    return entries
+
+
+def write_registry(entries, path):
+    """Atomic: write to path + '.tmp' then os.replace(tmp, path). Emits a
+    leading comment line documenting the column format."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    lines = ["# webui registry: <name>\t<absolute project dir>\n"]
+    for name in sorted(entries):
+        lines.append(f"{name}\t{entries[name]}\n")
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.writelines(lines)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# Daemon state: pidfile, webui.json, log
+# --------------------------------------------------------------------------
+
+def write_pid_file(pid):
+    os.makedirs(state_dir(), exist_ok=True)
+    tmp = pid_path() + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.write(str(pid) + '\n')
+    os.replace(tmp, pid_path())
+
+
+def write_state_json(data):
+    os.makedirs(state_dir(), exist_ok=True)
+    tmp = json_state_path() + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, indent=2)
+        fh.write('\n')
+    os.replace(tmp, json_state_path())
+
+
+def read_state_json():
+    try:
+        with open(json_state_path(), 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def remove_pid_files():
+    for p in (pid_path(), json_state_path()):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
+def check_pidfile():
+    """True | False | 'stale'. Pure read — never modifies the pidfile.
+    PID-reuse defense: cross-check /proc/<pid>/cmdline for both 'webui'
+    and '_serve' before trusting os.kill(pid, 0)."""
+    p = pid_path()
+    if not os.path.isfile(p):
+        return False
+    try:
+        with open(p, 'r', encoding='utf-8') as fh:
+            pid = int(fh.read().strip())
+    except (ValueError, OSError):
+        return 'stale'
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return 'stale'
+    except PermissionError:
+        pass  # process exists but isn't ours; fall through to /proc cross-check
+    except OSError:
+        return 'stale'
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+            raw = fh.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return 'stale'
+    text = ' '.join(part.decode(errors='replace') for part in raw.split(b'\x00'))
+    if 'webui' in text and '_serve' in text:
+        return True
+    return 'stale'
+
+
+def _port_in_use(port, host='127.0.0.1'):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        s.close()
+
+
+def _print_log_tail(n=20):
+    try:
+        with open(log_path(), 'r', encoding='utf-8', errors='replace') as fh:
+            lines = fh.readlines()
+        for line in lines[-n:]:
+            print("        " + line.rstrip())
+    except FileNotFoundError:
+        print("        (no log file yet)")
+
+
+def _pid_listens_on_port(pid, port):
+    """Best-effort but definitive check that `pid` itself (not some other
+    process that happens to already occupy the port) holds a LISTENing
+    socket on `port`, by cross-referencing /proc/net/tcp{,6} inodes against
+    pid's own fd table. This matters when starting with --force over an
+    already-occupied port: a naive "is anything listening on this port"
+    connect-check would false-positive on the pre-existing occupant even
+    though our freshly spawned child crashed on bind()."""
+    try:
+        fd_dir = f'/proc/{pid}/fd'
+        inodes = set()
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target.startswith('socket:[') and target.endswith(']'):
+                inodes.add(target[len('socket:['):-1])
+    except (FileNotFoundError, ProcessLookupError, PermissionError, NotADirectoryError):
+        return False
+    if not inodes:
+        return False
+    port_hex = format(port, '04X')
+    for procfile in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(procfile, 'r', encoding='utf-8') as fh:
+                next(fh, None)  # header line
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local_addr, state, inode = parts[1], parts[3], parts[9]
+                    if state != '0A':  # TCP_LISTEN
+                        continue
+                    _, hexport = local_addr.rsplit(':', 1)
+                    if hexport.upper() == port_hex and inode in inodes:
+                        return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def get_lan_ip():
+    try:
+        out = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
+        ip = out.stdout.split()[0]
+        if ip:
+            return ip
+    except Exception:
+        pass
+    return '127.0.0.1'
+
+
+def setup_logging():
+    os.makedirs(state_dir(), exist_ok=True)
+    logger = logging.getLogger('webui')
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    handler = logging.handlers.RotatingFileHandler(
+        log_path(), maxBytes=5 * 1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+# --------------------------------------------------------------------------
+# Registry hot reload (server-side): one os.stat() per request, reload only
+# on mtime change, whole-dict reference swap (atomic under the GIL).
+# --------------------------------------------------------------------------
+
+_registry_mtime = None
+_registry_data = {}
+
+
+def load_registry_cached():
+    global _registry_mtime, _registry_data
+    path = registry_path()
+    try:
+        mtime = os.stat(path).st_mtime
+    except FileNotFoundError:
+        _registry_mtime = None
+        _registry_data = {}
+        return _registry_data
+    if mtime != _registry_mtime:
+        _registry_data = read_registry(path)
+        _registry_mtime = mtime
+    return _registry_data
+
+
+def _entry_status(d):
+    if not os.path.isdir(d):
+        return 'MISSING'
+    if not os.path.isfile(os.path.join(d, 'index.html')):
+        return 'no index.html'
+    return 'ok'
+
+
+# --------------------------------------------------------------------------
+# HTTP handler
+# --------------------------------------------------------------------------
+
+class WebuiHandler(SimpleHTTPRequestHandler):
+    server_version = "webui/1.0"
+
+    # Checked before falling back to the stdlib mimetypes module (see
+    # guess_type), so these take priority without touching global state.
+    # mimetypes has no entry for .log (falls to application/octet-stream)
+    # and maps .cu to the legacy 'application/cu-seeme' videoconferencing
+    # type (an old accidental collision with CUDA source) — both cause
+    # browsers to force-download instead of rendering these as text, which
+    # matters for a tool built around viewing kernel/benchmark logs.
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        '.log': 'text/plain',
+        '.cu': 'text/plain',
+        '.cuh': 'text/plain',
+        '.txt': 'text/plain',
+    }
+
+    def do_GET(self):
+        if self._prepare():
+            super().do_GET()
+
+    def do_HEAD(self):
+        if self._prepare():
+            super().do_HEAD()
+
+    def _prepare(self):
+        """Resolve the first path segment as <name>, look it up in the
+        hot-reloaded registry, check the target dir still exists, stash it
+        on self._webui_root, return True to fall through to the stock
+        handler. Handles '/', unknown names, and vanished dirs itself and
+        returns False."""
+        raw_path = self.path.split('?', 1)[0].split('#', 1)[0]
+        if raw_path in ('', '/'):
+            self._serve_index()
+            return False
+        segments = [s for s in raw_path.split('/') if s != '']
+        name_enc = segments[0]
+        try:
+            name = urllib.parse.unquote(name_enc, errors='surrogatepass')
+        except UnicodeDecodeError:
+            name = urllib.parse.unquote(name_enc)
+        registry = load_registry_cached()
+        if name not in registry:
+            self.send_error(404, f"Unknown dashboard '{name}'. See GET / for the list of registered dashboards.")
+            return False
+        target_dir = registry[name]
+        if not os.path.isdir(target_dir):
+            self.send_error(404, f"registered directory no longer exists: {target_dir}")
+            return False
+        self._webui_root = target_dir
+        return True
+
+    def translate_path(self, path):
+        """Mirror CPython 3.12 SimpleHTTPRequestHandler.translate_path,
+        rooted at self._webui_root and dropping the leading <name> segment.
+
+        Traversal defense, two layers:
+          1. posixpath.normpath on the unquoted path, then rebuild by
+             joining segment-by-segment onto the root, skipping any segment
+             where os.path.dirname(word) is truthy or word is '.'/'..'.
+             (Structurally cannot escape real_root: every appended word is a
+             bare filename, never a path.)
+          2. A realpath containment check that catches a symlink INSIDE the
+             registered root pointing outside it (normpath can't see through
+             symlinks).
+        On a blocked request, return a path to a plain nonexistent filename
+        inside the root — NOT a NUL-byte sentinel, which would make open()
+        raise ValueError (uncaught by send_head's `except OSError`) -> 500
+        instead of the desired clean 404.
+
+        This is a FIRST-PASS filter only — fast, and good enough to route
+        directory listing / index-page / 301-redirect decisions (see
+        send_head below). It is deliberately NOT the last word on whether a
+        file's bytes get disclosed: the string this returns is re-resolved
+        by whoever opens it, so a symlink swapped in after this check runs
+        would silently redirect that later open() elsewhere. The actual
+        byte-disclosing read goes through _webui_safe_open, which re-derives
+        the target from scratch with no reliance on this check having stayed
+        true.
+
+        Any ValueError here (e.g. os.path.realpath on a %00-smuggled NUL
+        byte) is treated the same as an escape attempt: blocked, not
+        propagated — send_head's `except OSError` around the eventual open()
+        does not cover ValueError, so letting one through here would crash
+        the request thread instead of producing the intended clean 404.
+        """
+        root = getattr(self, '_webui_root', None)
+        if root is None:
+            return os.path.join(os.getcwd(), BLOCKED_SENTINEL)
+
+        try:
+            real_root = os.path.realpath(root)
+        except (ValueError, OSError):
+            return os.path.join(root, BLOCKED_SENTINEL)
+
+        try:
+            p = path.split('?', 1)[0]
+            p = p.split('#', 1)[0]
+            trailing_slash = p.rstrip().endswith('/')
+            try:
+                p = urllib.parse.unquote(p, errors='surrogatepass')
+            except UnicodeDecodeError:
+                p = urllib.parse.unquote(p)
+            p = posixpath.normpath(p)
+            words = [w for w in p.split('/') if w]
+            if words:
+                words = words[1:]  # drop the <name> segment
+
+            out = real_root
+            for word in words:
+                if os.path.dirname(word) or word in (os.curdir, os.pardir):
+                    continue
+                out = os.path.join(out, word)
+
+            real_out = os.path.realpath(out)
+        except (ValueError, OSError):
+            return os.path.join(real_root, BLOCKED_SENTINEL)
+
+        if real_out != real_root and not real_out.startswith(real_root + os.sep):
+            return os.path.join(real_root, BLOCKED_SENTINEL)
+
+        if trailing_slash:
+            out += '/'
+        return out
+
+    def _webui_safe_open(self, path):
+        """Race-free re-resolution of `path` (a string already validated —
+        loosely — by translate_path, rooted under self._webui_root) into an
+        open binary file object, immune to the TOCTOU window between that
+        earlier string-based check and this open.
+
+        Walks from real_root down to the target one path component at a
+        time, opening each with O_NOFOLLOW relative to the PREVIOUS hop's
+        file descriptor (dir_fd=), never by re-joining/re-resolving a path
+        string. Once a directory has been opened this way its fd is pinned
+        to that exact inode: even if something later replaces that name
+        elsewhere in the tree (e.g. swaps it for a symlink out to /etc), our
+        fd still refers to the original directory, and the *next* hop is
+        looked up inside THAT inode, not by walking the name again from
+        scratch. O_NOFOLLOW on every hop (including the last) means that if
+        a component IS a symlink at the moment we reach it, the open fails
+        outright (ELOOP) rather than following it — so, as a side effect,
+        symlinks anywhere under a registered root are no longer served, even
+        ones that point back within the root. That's a deliberate tightening
+        (no known user of this tool relies on internal symlinks), traded for
+        actually closing the race rather than merely narrowing it.
+
+        Raises OSError (ValueError is also normalized to OSError) if the
+        walk fails for any reason; callers should treat that as "file not
+        found".
+        """
+        real_root = os.path.realpath(self._webui_root)
+        try:
+            rel = os.path.relpath(path, real_root)
+        except ValueError as e:
+            raise OSError(str(e)) from e
+        words = [] if rel == os.curdir else rel.split(os.sep)
+        if not words or any(not w or w in (os.curdir, os.pardir) for w in words):
+            raise OSError(f"unsafe resolved path: {path!r}")
+
+        try:
+            dir_fd = os.open(real_root, os.O_RDONLY)
+        except ValueError as e:
+            raise OSError(str(e)) from e
+        try:
+            for word in words[:-1]:
+                try:
+                    nxt = os.open(word, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                   dir_fd=dir_fd)
+                except ValueError as e:
+                    raise OSError(str(e)) from e
+                os.close(dir_fd)
+                dir_fd = nxt
+            try:
+                file_fd = os.open(words[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except ValueError as e:
+                raise OSError(str(e)) from e
+            return os.fdopen(file_fd, 'rb')
+        finally:
+            os.close(dir_fd)
+
+    def send_head(self):
+        """Same contract and (for the directory/redirect/index-page
+        branches) same logic as SimpleHTTPRequestHandler.send_head — see
+        its docstring — with one change: the final open() of the bytes that
+        actually get sent to the client goes through _webui_safe_open
+        instead of the builtin open(path, 'rb'). That's the only line where
+        stock send_head touches file *content*; everywhere else (isdir
+        checks for routing, list_directory) still resolves by path string
+        like stock behavior, since those only affect which branch is taken
+        or which filenames get listed, not which bytes get disclosed.
+        """
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            parts = urllib.parse.urlsplit(self.path)
+            if not parts.path.endswith('/'):
+                self.send_response(301)
+                new_parts = (parts[0], parts[1], parts[2] + '/', parts[3], parts[4])
+                new_url = urllib.parse.urlunsplit(new_parts)
+                self.send_header("Location", new_url)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            for index in self.index_pages:
+                index_path = os.path.join(path, index)
+                if os.path.isfile(index_path):
+                    path = index_path
+                    break
+            else:
+                return self.list_directory(path)
+
+        ctype = self.guess_type(path)
+        if path.endswith("/"):
+            self.send_error(404, "File not found")
+            return None
+
+        try:
+            f = self._webui_safe_open(path)
+        except OSError:
+            self.send_error(404, "File not found")
+            return None
+
+        try:
+            fs = os.fstat(f.fileno())
+            if ("If-Modified-Since" in self.headers
+                    and "If-None-Match" not in self.headers):
+                try:
+                    ims = email.utils.parsedate_to_datetime(self.headers["If-Modified-Since"])
+                except (TypeError, IndexError, OverflowError, ValueError):
+                    pass
+                else:
+                    if ims.tzinfo is None:
+                        ims = ims.replace(tzinfo=datetime.timezone.utc)
+                    if ims.tzinfo is datetime.timezone.utc:
+                        last_modif = datetime.datetime.fromtimestamp(
+                            fs.st_mtime, datetime.timezone.utc)
+                        last_modif = last_modif.replace(microsecond=0)
+                        if last_modif <= ims:
+                            self.send_response(304)
+                            self.end_headers()
+                            f.close()
+                            return None
+
+            self.send_response(200)
+            self.send_header("Content-type", ctype)
+            self.send_header("Content-Length", str(fs[6]))
+            self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+            self.end_headers()
+            return f
+        except:
+            f.close()
+            raise
+
+    def log_message(self, fmt, *args):
+        logging.getLogger('webui.access').info("%s - %s", self.address_string(), fmt % args)
+
+    def _serve_index(self):
+        registry = load_registry_cached()
+        rows = []
+        for name in sorted(registry):
+            d = registry[name]
+            rows.append((name, d, _entry_status(d)))
+
+        body_rows = []
+        for name, d, status in rows:
+            esc_name = html.escape(name)
+            esc_d = html.escape(d)
+            esc_status = html.escape(status)
+            href = html.escape(f"/{urllib.parse.quote(name)}/")
+            body_rows.append(
+                f"<tr><td><a href=\"{href}\">{esc_name}</a></td>"
+                f"<td>{esc_status}</td><td>{esc_d}</td></tr>"
+            )
+        table_body = "\n".join(body_rows) if body_rows else \
+            "<tr><td colspan=\"3\"><em>no dashboards registered</em></td></tr>"
+
+        doc = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>webui</title>
+<style>
+body{{font-family:sans-serif;margin:2rem;}}
+table{{border-collapse:collapse;width:100%;}}
+th,td{{border:1px solid #ccc;padding:0.4rem 0.8rem;text-align:left;}}
+th{{background:#eee;}}
+</style></head>
+<body>
+<h1>webui &mdash; registered dashboards</h1>
+<p>{html.escape(str(len(rows)))} registered.</p>
+<table>
+<tr><th>name</th><th>status</th><th>path</th></tr>
+{table_body}
+</table>
+</body></html>
+"""
+        encoded = doc.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(encoded)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(encoded)
+
+
+def serve_forever(port, bind, logger=None):
+    logger = logger or logging.getLogger('webui')
+    server = ThreadingHTTPServer((bind, port), WebuiHandler)
+    server.daemon_threads = True
+    logger.info("webui daemon listening on %s:%s", bind, port)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        logger.info("received KeyboardInterrupt, shutting down")
+    finally:
+        server.server_close()
+        logger.info("webui daemon stopped")
+
+
+# --------------------------------------------------------------------------
+# CLI commands
+# --------------------------------------------------------------------------
+
+def cmd_register(args):
+    target = os.path.realpath(args.path or '.')
+    if not os.path.isdir(target):
+        print(f"[ERROR] not a directory: {target}", file=sys.stderr)
+        return 1
+    if '\t' in target or '\n' in target:
+        print(f"[ERROR] resolved path contains a tab/newline character, which "
+              f"the registry format (TSV) can't represent: {target!r}", file=sys.stderr)
+        return 1
+    raw_name = args.name if args.name else os.path.basename(target.rstrip(os.sep))
+    try:
+        name = normalize_name(raw_name)
+    except ValueError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
+
+    registry = read_registry(registry_path())
+    if name in registry:
+        existing = registry[name]
+        if existing == target:
+            print(f"[OK] '{name}' already registered -> {target} (no-op)")
+            _maybe_build(target, args)
+            return 0
+        if not args.force:
+            print(f"[ERROR] name '{name}' already registered to a different path:", file=sys.stderr)
+            print(f"        existing : {existing}", file=sys.stderr)
+            print(f"        requested: {target}", file=sys.stderr)
+            print(f"        use --force to overwrite", file=sys.stderr)
+            return 1
+        print(f"[WARN] overwriting registration '{name}': {existing} -> {target}")
+
+    registry[name] = target
+    write_registry(registry, registry_path())
+    print(f"[OK] registered '{name}' -> {target}")
+    print(f"     URL: /{name}/")
+    _maybe_build(target, args)
+    return 0
+
+
+def _maybe_build(target, args):
+    index = os.path.join(target, 'index.html')
+    if os.path.isfile(index):
+        return
+    gen = os.path.join(target, 'generate_web_dashboard.py')
+    if getattr(args, 'build', False) and os.path.isfile(gen):
+        print(f"[BUILD] generating index.html via {gen} ...")
+        subprocess.run([sys.executable, gen], cwd=target, check=True)
+        print("[BUILD] done")
+    else:
+        print(f"[WARN] no index.html in {target}")
+        if os.path.isfile(gen):
+            print(f"        run: python3 {gen}   (or: webui register {target} --build)")
+        else:
+            print("        (no generate_web_dashboard.py found either; a directory listing will be served)")
+
+
+def cmd_unregister(args):
+    try:
+        name = normalize_name(args.name)
+    except ValueError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
+    registry = read_registry(registry_path())
+    if name not in registry:
+        print(f"[ERROR] '{name}' is not registered.", file=sys.stderr)
+        return 1
+    d = registry.pop(name)
+    write_registry(registry, registry_path())
+    print(f"[OK] unregistered '{name}' (was -> {d})")
+    return 0
+
+
+def cmd_list(args):
+    registry = read_registry(registry_path())
+    daemon_up = check_pidfile() is True
+
+    if args.json:
+        entries = [{'name': n, 'path': registry[n], 'status': _entry_status(registry[n])}
+                   for n in sorted(registry)]
+        print(json.dumps({'daemon_running': daemon_up, 'entries': entries}, indent=2))
+        return 0
+
+    print("========================================================================")
+    print(" 📊 webui registered dashboards")
+    print("========================================================================")
+    if not registry:
+        print(" (none registered)")
+    for name in sorted(registry):
+        d = registry[name]
+        status = _entry_status(d)
+        icon = {'ok': '✅', 'MISSING': '❌', 'no index.html': '⚠️ '}[status]
+        print(f" {icon} {name:<30} {status:<15} {d}")
+    print("========================================================================")
+    if daemon_up:
+        info = read_state_json() or {}
+        print(f" 🟢 daemon running (pid {info.get('pid', '?')}, port {info.get('port', '?')})")
+    else:
+        print(" 🔴 daemon not running (run 'webui start' to serve these)")
+    print("========================================================================")
+    return 0
+
+
+def cmd_prune(args):
+    registry = read_registry(registry_path())
+    kept = {}
+    removed = []
+    for name, d in registry.items():
+        if os.path.isdir(d):
+            kept[name] = d
+        else:
+            removed.append((name, d))
+    if removed:
+        write_registry(kept, registry_path())
+    plural = lambda n: 'y' if n == 1 else 'ies'
+    print(f"[PRUNE] removed {len(removed)} entr{plural(len(removed))}")
+    for name, d in removed:
+        print(f"   - {name} ({d})")
+    print(f"[PRUNE] {len(kept)} entr{plural(len(kept))} remain")
+    return 0
+
+
+def cmd_start(args):
+    port, bind, force = args.port, args.bind, args.force
+    os.makedirs(state_dir(), exist_ok=True)
+
+    st = check_pidfile()
+    if st is True:
+        info = read_state_json() or {}
+        ip = get_lan_ip()
+        print("========================================================================")
+        print(" ℹ️  webui daemon is ALREADY running (nothing spawned)")
+        print(f" PID  : {info.get('pid', '?')}")
+        print(f" Port : {info.get('port', '?')}")
+        print(f" Bind : {info.get('bind', '?')}")
+        print(f" URL  : http://{ip}:{info.get('port', '?')}/")
+        print(f" Local: http://localhost:{info.get('port', '?')}/")
+        print("========================================================================")
+        return 0
+    if st == 'stale':
+        print("[INFO] found a stale pidfile (process gone or not a webui daemon); removing it.")
+        remove_pid_files()
+
+    check_host = bind if bind not in ('0.0.0.0', '::') else '127.0.0.1'
+    if not force and _port_in_use(port, host=check_host):
+        print(f"[ERROR] port {port} is already in use by something else (not a webui daemon).", file=sys.stderr)
+        print("        Use --force to start anyway, or pick a different --port.", file=sys.stderr)
+        return 1
+
+    os.makedirs(state_dir(), exist_ok=True)
+    script = os.path.abspath(__file__)
+    logfh = open(log_path(), 'a')
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, script, '_serve', '--port', str(port), '--bind', bind],
+            stdin=subprocess.DEVNULL,
+            stdout=logfh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    finally:
+        logfh.close()
+
+    deadline = time.time() + 5.0
+    listening = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if _pid_listens_on_port(proc.pid, port):
+            listening = True
+            break
+        time.sleep(0.1)
+
+    if not listening:
+        print(f"[ERROR] webui daemon failed to start listening on {bind}:{port} within 5s.", file=sys.stderr)
+        rc = proc.poll()
+        if rc is not None:
+            print(f"        child process exited with code {rc}", file=sys.stderr)
+        print(f"        Log tail ({log_path()}):", file=sys.stderr)
+        _print_log_tail()
+        return 1
+
+    write_pid_file(proc.pid)
+    write_state_json({
+        'pid': proc.pid, 'port': port, 'bind': bind,
+        'started_at': datetime.datetime.now().isoformat(timespec='seconds'),
+    })
+    ip = get_lan_ip()
+    print("========================================================================")
+    print(" 🚀 webui daemon started successfully!")
+    print(f" PID  : {proc.pid}")
+    print(f" Port : {port}")
+    print(f" Bind : {bind}")
+    print(f" URL  : http://{ip}:{port}/")
+    print(f" Local: http://localhost:{port}/")
+    print(f" Log  : {log_path()}")
+    print("========================================================================")
+    return 0
+
+
+def cmd_run(args):
+    port, bind = args.port, args.bind
+    logger = setup_logging()
+    ip = get_lan_ip()
+    print("========================================================================")
+    print(" 🚀 webui running in FOREGROUND (Ctrl+C to stop)")
+    print(f" Port : {port}")
+    print(f" Bind : {bind}")
+    print(f" URL  : http://{ip}:{port}/")
+    print(f" Local: http://localhost:{port}/")
+    print("========================================================================")
+    serve_forever(port, bind, logger)
+    return 0
+
+
+def cmd_serve(args):
+    logger = setup_logging()
+    serve_forever(args.port, args.bind, logger)
+    return 0
+
+
+def cmd_stop(args):
+    force = args.force
+    st = check_pidfile()
+    if st is False:
+        print("🔴 webui daemon is not running.")
+        return 0
+    if st == 'stale':
+        print("[INFO] pidfile is stale (process gone or not a webui daemon); cleaning up.")
+        remove_pid_files()
+        print("🔴 webui daemon is not running.")
+        return 0
+
+    with open(pid_path(), 'r', encoding='utf-8') as fh:
+        pid = int(fh.read().strip())
+    print(f"[STOP] stopping webui daemon (pid {pid})...")
+
+    def alive():
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    if force:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        time.sleep(0.3)
+        if alive():
+            print(f"[ERROR] failed to stop pid {pid} (still alive after SIGKILL)", file=sys.stderr)
+            return 1
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + 5.0
+        while time.time() < deadline and alive():
+            time.sleep(0.2)
+        if alive():
+            print("[WARN] process still alive after SIGTERM, escalating to SIGKILL")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.5)
+            if alive():
+                print(f"[ERROR] failed to stop pid {pid} (still alive after SIGKILL)", file=sys.stderr)
+                return 1
+
+    remove_pid_files()
+    print("[OK] webui daemon stopped.")
+    return 0
+
+
+def cmd_restart(args):
+    """Resolve the effective port/bind BEFORE stopping: explicit --port/
+    --bind on the command line wins; otherwise reuse whatever the
+    about-to-be-stopped daemon was actually running with (from webui.json);
+    only fall back to DEFAULT_PORT/DEFAULT_BIND if no prior state exists at
+    all. Without this, a bare 'webui restart' would silently ignore the
+    daemon's real port/bind and reach for the hardcoded CLI defaults
+    instead, which either collides with something else already using that
+    default port (leaving the daemon offline) or silently comes back up on
+    the wrong port, breaking every previously-distributed /name/ URL."""
+    prev = read_state_json()
+    port = args.port if args.port is not None else \
+        (prev.get('port', DEFAULT_PORT) if prev else DEFAULT_PORT)
+    bind = args.bind if args.bind is not None else \
+        (prev.get('bind', DEFAULT_BIND) if prev else DEFAULT_BIND)
+    cmd_stop(argparse.Namespace(force=args.force))
+    time.sleep(0.5)
+    return cmd_start(argparse.Namespace(port=port, bind=bind, force=args.force))
+
+
+def cmd_status(args):
+    """STRICTLY READ-ONLY: never creates, modifies, or deletes the pidfile."""
+    st = check_pidfile()
+    registry = read_registry(registry_path())
+    issues = [(n, _entry_status(d), d) for n, d in registry.items() if _entry_status(d) != 'ok']
+
+    if st is True:
+        info = read_state_json() or {}
+        ip = get_lan_ip()
+        print("========================================================================")
+        print(" 🟢 webui daemon is RUNNING")
+        print(f" PID  : {info.get('pid', '?')}")
+        print(f" Port : {info.get('port', '?')}")
+        print(f" Bind : {info.get('bind', '?')}")
+        print(f" Since: {info.get('started_at', '?')}")
+        print(f" URL  : http://{ip}:{info.get('port', '?')}/")
+        print(f" Local: http://localhost:{info.get('port', '?')}/")
+        print(f" Registered: {len(registry)} dashboard(s)")
+        if issues:
+            print(" Issues:")
+            for name, kind, d in issues:
+                print(f"   - {name}: {kind} ({d})")
+        print("========================================================================")
+        return 0
+
+    reason = "stale pidfile" if st == 'stale' else "not running"
+    print(f"🔴 webui daemon is NOT running ({reason}).")
+    print(f" Registered: {len(registry)} dashboard(s)")
+    if issues:
+        print(" Issues:")
+        for name, kind, d in issues:
+            print(f"   - {name}: {kind} ({d})")
+    return 1
+
+
+def cmd_url(args):
+    try:
+        name = normalize_name(args.name)
+    except ValueError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
+    registry = read_registry(registry_path())
+    if name not in registry:
+        print(f"[ERROR] '{name}' is not registered.", file=sys.stderr)
+        return 1
+    info = read_state_json()
+    port = info['port'] if info else DEFAULT_PORT
+    ip = get_lan_ip()
+    print(f"http://{ip}:{port}/{name}/")
+    print(f"http://localhost:{port}/{name}/")
+    if not info:
+        print("(note: daemon does not appear to be running; start it with 'webui start')", file=sys.stderr)
+    return 0
+
+
+def cmd_open(args):
+    try:
+        name = normalize_name(args.name)
+    except ValueError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
+    registry = read_registry(registry_path())
+    if name not in registry:
+        print(f"[ERROR] '{name}' is not registered.", file=sys.stderr)
+        return 1
+    info = read_state_json()
+    port = info['port'] if info else DEFAULT_PORT
+    url = f"http://localhost:{port}/{name}/"
+    opener = shutil.which('xdg-open')
+    if opener:
+        try:
+            subprocess.Popen([opener, url], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+            print(f"[OK] opened {url}")
+            return 0
+        except OSError as e:
+            print(f"[WARN] xdg-open failed: {e}", file=sys.stderr)
+    print(url)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argparse wiring
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog='webui', description='Global multiplexing dashboard HTTP service.')
+    sub = p.add_subparsers(dest='command', required=True)
+
+    sp = sub.add_parser('register', help='Register a project directory to be served under /<name>/')
+    sp.add_argument('path', nargs='?', default='.', help='Project directory (default: current directory)')
+    sp.add_argument('--name', help='URL name (default: normalized basename of PATH)')
+    sp.add_argument('--force', action='store_true', help='Overwrite an existing registration pointing elsewhere')
+    sp.add_argument('--build', action='store_true', help='Run generate_web_dashboard.py if index.html is missing')
+    sp.set_defaults(func=cmd_register)
+
+    sp = sub.add_parser('unregister', help='Remove a registration')
+    sp.add_argument('name')
+    sp.set_defaults(func=cmd_unregister)
+
+    sp = sub.add_parser('list', help='List registered dashboards (client-side; works with the daemon down)')
+    sp.add_argument('--json', action='store_true', help='Emit JSON instead of a table')
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser('prune', help='Remove registrations whose directory no longer exists')
+    sp.set_defaults(func=cmd_prune)
+
+    sp = sub.add_parser('start', help='Start the daemon in the background')
+    sp.add_argument('--port', type=int, default=DEFAULT_PORT)
+    sp.add_argument('--bind', default=DEFAULT_BIND)
+    sp.add_argument('--force', action='store_true', help='Skip the "port already in use" check')
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser('run', help='Run the server in the foreground (Ctrl+C stops)')
+    sp.add_argument('--port', type=int, default=DEFAULT_PORT)
+    sp.add_argument('--bind', default=DEFAULT_BIND)
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser('stop', help='Stop the daemon')
+    sp.add_argument('--force', action='store_true', help='SIGKILL immediately instead of SIGTERM-then-wait')
+    sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser('restart', help='Stop then start the daemon (reuses the '
+                                         'previous port/bind unless overridden)')
+    sp.add_argument('--port', type=int, default=None,
+                     help=f'default: whatever the running daemon was using, else {DEFAULT_PORT}')
+    sp.add_argument('--bind', default=None,
+                     help=f'default: whatever the running daemon was using, else {DEFAULT_BIND}')
+    sp.add_argument('--force', action='store_true')
+    sp.set_defaults(func=cmd_restart)
+
+    sp = sub.add_parser('status', help='Report daemon status (strictly read-only)')
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser('url', help='Print the URL(s) for a registered name')
+    sp.add_argument('name')
+    sp.set_defaults(func=cmd_url)
+
+    sp = sub.add_parser('open', help='Open a registered dashboard in a browser (best-effort xdg-open)')
+    sp.add_argument('name')
+    sp.set_defaults(func=cmd_open)
+
+    sp = sub.add_parser('_serve')  # internal, no help= so it's omitted from the subcommand list
+    sp.add_argument('--port', type=int, default=DEFAULT_PORT)
+    sp.add_argument('--bind', default=DEFAULT_BIND)
+    sp.set_defaults(func=cmd_serve)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
