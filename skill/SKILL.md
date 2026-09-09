@@ -97,15 +97,17 @@ Finish by giving the user both URLs (`http://<lan-ip>:8800/<name>/` and
 
 - **Path-prefix safety is a hard requirement.** The page is served under
   `/<project-name>/...`, not at a domain root, so anything root-absolute will 404
-  or — worse — resolve into a *different* project once mounted under a prefix. The
+  or — worse — resolve into a _different_ project once mounted under a prefix. The
   generator must never emit `href="/..."`, `src="/..."`, `url(/...)`,
   `fetch("/...")`, or `<base href="/">`, and must never read
   `window.location.origin`/`pathname` to build request URLs. Relative paths,
   inlined content, and `location.hash` are all prefix-agnostic and safe. Spot-check
   before registering:
+
   ```bash
   grep -oE '(href|src)="/[^/]|url\(/|fetch\("/|<base' index.html    # should match nothing
   ```
+
   A generator that inlines everything and never builds a URL from the page's own
   location needs zero edits to mount under a prefix — that's the bar to hold new
   generators to.
@@ -140,5 +142,16 @@ npx github:Realtyxxx/report-web-dashboard-skill            # → ~/.agents/skill
 npx github:Realtyxxx/report-web-dashboard-skill --claude   # → ~/.claude/skills/report-web-dashboard
 ```
 
-The installer also links `scripts/webui` onto your `PATH` at `~/.local/bin/webui`.
-Pass `--no-link` to skip that and keep the command out of your `PATH`.
+The installer also links `scripts/webui` at `~/.local/bin/webui` and the bundled
+Zsh completion `completions/_webui` at `~/.zsh/completion/_webui`. Ensure the
+completion directory is in `fpath` before `compinit` or Oh My Zsh initializes.
+Open a new terminal, or run `autoload -Uz _webui; compdef _webui webui` in an
+already initialized Zsh session. Complete subcommands, options, directories,
+and registered project names without starting the daemon.
+
+Pass `--no-link` to skip both links, `--no-completion` to skip only completion,
+or `--completion-dir <path>` to use an existing Zsh completion directory.
+Preserve unrelated files; use `--force-link` only for an explicitly approved
+takeover. Do not edit shell startup files automatically. Bash and Fish are not
+supported. After a `personal-skills` bulk install, run this package's installer
+with `--force` to create the command and completion links.

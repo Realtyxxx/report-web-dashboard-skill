@@ -1,0 +1,83 @@
+#compdef webui
+
+local context state state_descr line expl
+local -A opt_args
+local -a commands names columns
+local registry row name directory
+
+commands=(
+  'register:Register a project directory'
+  'unregister:Remove a registration'
+  'list:List registered dashboards'
+  'prune:Remove missing project registrations'
+  'start:Start the daemon'
+  'run:Run the server in the foreground'
+  'stop:Stop the daemon'
+  'restart:Restart the daemon'
+  'status:Report daemon status'
+  'url:Print dashboard URLs'
+  'open:Open a dashboard'
+)
+
+_arguments -C -S \
+  '(-h --help)'{-h,--help}'[Show help]' \
+  '1:command:->commands' \
+  '*::argument:->arguments'
+
+case $state in
+  commands)
+    _describe 'webui command' commands
+    ;;
+  arguments)
+    case $words[1] in
+      register)
+        _arguments -S \
+          '(-h --help)'{-h,--help}'[Show help]' \
+          '--name=[URL name]:name:' \
+          '--force[Overwrite an existing registration]' \
+          '--build[Build a missing index.html]' \
+          '1:project directory:_directories'
+        ;;
+      unregister|url|open)
+        _arguments -S \
+          '(-h --help)'{-h,--help}'[Show help]' \
+          '1:registered project:->projects'
+        if [[ $state == projects ]]; then
+          registry=${WEBUI_HOME:+$WEBUI_HOME/config/registry.tsv}
+          registry=${registry:-$HOME/.config/webui/registry.tsv}
+          if [[ -r $registry ]]; then
+            setopt localoptions extendedglob
+            while IFS= read -r row || [[ -n $row ]]; do
+              [[ $row == [[:space:]]#\#* ]] && continue
+              columns=("${(@ps:\t:)row}")
+              (( $#columns == 2 )) || continue
+              name=${${columns[1]##[[:space:]]#}%%[[:space:]]#}
+              directory=${${columns[2]##[[:space:]]#}%%[[:space:]]#}
+              [[ -n $name && -n $directory && $name != (.|..) && $name != *[^A-Za-z0-9._-]* ]] || continue
+              names+=("$name")
+            done < "$registry"
+          fi
+          _wanted projects expl 'registered project' compadd -a names
+        fi
+        ;;
+      start|restart|run)
+        local -a options
+        [[ $words[1] != run ]] && options+=('--force[Force daemon operation]')
+        _arguments -S \
+          '(-h --help)'{-h,--help}'[Show help]' \
+          '--port=[Listening port]:port:' \
+          '--bind=[Listening address]:address:(127.0.0.1 0.0.0.0)' \
+          "${options[@]}"
+        ;;
+      stop)
+        _arguments -S '(-h --help)'{-h,--help}'[Show help]' '--force[Stop immediately]'
+        ;;
+      list)
+        _arguments -S '(-h --help)'{-h,--help}'[Show help]' '--json[Emit JSON]'
+        ;;
+      prune|status)
+        _arguments -S '(-h --help)'{-h,--help}'[Show help]'
+        ;;
+    esac
+    ;;
+esac

@@ -30,7 +30,7 @@ webui url my-project    # → http://<lan-ip>:8800/my-project/
 
 One daemon, one port, N dashboards:
 
-```
+```text
 http://host:8800/                    # index of everything registered
 http://host:8800/project-a/          # project A's dashboard
 http://host:8800/project-b/          # project B's dashboard
@@ -48,6 +48,8 @@ npx github:Realtyxxx/report-web-dashboard-skill --dir <path> # → <path>/report
 npx github:Realtyxxx/report-web-dashboard-skill --force      # overwrite an existing skill install
 npx github:Realtyxxx/report-web-dashboard-skill --force-link # take over an occupied ~/.local/bin/webui
 npx github:Realtyxxx/report-web-dashboard-skill --no-link    # skip the PATH symlink entirely
+npx github:Realtyxxx/report-web-dashboard-skill --no-completion # skip the Zsh completion link
+npx github:Realtyxxx/report-web-dashboard-skill --completion-dir <path> # default: ~/.zsh/completion
 ```
 
 The installer copies `skill/` into your skills directory and links
@@ -57,19 +59,48 @@ because reinstalling a skill is routine while taking over a command on someone's
 `PATH` is not; that needs the separate `--force-link`. If a daemon is already
 running an older build, the installer tells you to run `webui restart`.
 
+The installer also links `completions/_webui` to `~/.zsh/completion/_webui`.
+Zsh completion covers public subcommands, their options, project directories,
+and registered names for `url`, `open`, and `unregister`. Names are read directly
+from the registry on each completion, without starting the daemon or accessing
+the network; `WEBUI_HOME` is respected. Bash and Fish completions are not bundled.
+
+If `~/.zsh/completion` is already in `fpath` and `compinit` is enabled, open a
+new terminal. To activate in the current initialized Zsh session:
+
+```zsh
+autoload -Uz _webui
+compdef _webui webui
+```
+
+Otherwise, add the completion directory to `fpath` **before** the existing
+`compinit` or Oh My Zsh initialization. For a shell without a completion setup:
+
+```zsh
+fpath=("$HOME/.zsh/completion" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+The installer does not edit shell startup files. `--no-link` skips both command
+and completion links; `--no-completion` skips only the completion link. Existing
+unrelated completion files are preserved unless `--force-link` is explicit.
+The `personal-skills` bulk installer copies skill assets only; run this package's
+installer afterward with `--force` to create the command and completion links.
+
 Requires Python 3.8+ (stdlib only — no pip packages) and Node 18+ for the
 installer.
 
 ## `webui` reference
 
-| | |
-|---|---|
+|                                                        |                                                                                               |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
 | `webui register [PATH] [--name N] [--build] [--force]` | register a project dir; `--build` runs `generate_web_dashboard.py` if `index.html` is missing |
-| `webui unregister NAME` / `webui prune` | remove one entry / drop entries whose dir vanished |
-| `webui list [--json]` | registered dashboards + status (works with the daemon down) |
-| `webui start` / `stop` / `restart` / `status` | daemon lifecycle; `status` is strictly read-only |
-| `webui run` | foreground, Ctrl+C stops |
-| `webui url NAME` / `webui open NAME` | print / open the dashboard URL |
+| `webui unregister NAME` / `webui prune`                | remove one entry / drop entries whose dir vanished                                            |
+| `webui list [--json]`                                  | registered dashboards + status (works with the daemon down)                                   |
+| `webui start` / `stop` / `restart` / `status`          | daemon lifecycle; `status` is strictly read-only                                              |
+| `webui run`                                            | foreground, Ctrl+C stops                                                                      |
+| `webui url NAME` / `webui open NAME`                   | print / open the dashboard URL                                                                |
 
 Routing: `/` lists everything · `/<name>` 301s to `/<name>/` · `/<name>/` serves
 that project's `index.html` · `/<name>/<sub>` serves files beneath it. An
@@ -84,7 +115,7 @@ State lives in `~/.local/state/webui/` (`webui.pid`, `webui.json`, and
   at a domain root, so a generator must never emit `href="/…"`, `src="/…"`,
   `fetch("/…")`, or `<base href="/">`, and must never build URLs from
   `window.location.origin`/`pathname`. Root-absolute references will 404 or, worse,
-  resolve into a *different* project. Relative paths, inlined content, and
+  resolve into a _different_ project. Relative paths, inlined content, and
   `location.hash` are all safe.
 - **Symlinks under a registered root are not followed** — they return 404. This is
   deliberate: resolving them opened a TOCTOU race where a symlink swapped between
@@ -104,11 +135,12 @@ State lives in `~/.local/state/webui/` (`webui.pid`, `webui.json`, and
 
 ## Layout
 
-```
+```text
 skill/
   SKILL.md            the skill itself
   scripts/webui       the global multiplexing daemon + CLI (Python, stdlib only)
   scripts/server.sh   zero-dependency single-project fallback for machines without webui
+  completions/_webui  bundled Zsh completion definition
 bin/install.js        the npx installer
 ```
 
