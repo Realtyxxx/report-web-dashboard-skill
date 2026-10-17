@@ -78,6 +78,7 @@ dashboard under its own URL path prefix, instead of each project running its own
 webui register .              # name defaults to the directory basename
 webui register . --build      # also runs generate_web_dashboard.py if index.html is missing
 webui start                   # idempotent; no-op if the daemon is already up
+webui restart                 # REQUIRED after registering a new directory (see sandbox note)
 webui list                    # every registered project + daemon status
 webui url <name>              # print this project's URL
 ```
@@ -86,6 +87,16 @@ The project is then reachable at `http://<lan-ip>:8800/<name>/` and
 `http://localhost:8800/<name>/` — there is no per-project process to manage, no
 port to pick, and nothing to stop or clean up when you're done. Run `webui --help`
 for the full command reference.
+
+**Sandbox note**: where bubblewrap (`bwrap`) is available, the daemon runs inside
+a bwrap sandbox by default — a read-only mount of exactly the registered project
+directories, so a path-traversal or RCE bug in the server cannot reach SSH keys,
+tokens, or anything else in the home directory. Consequence: mounts are fixed at
+daemon start, so after `webui register`-ing a directory outside the already
+mounted roots you must run `webui restart` before its URL serves (both `register`
+and the 404 page tell you when this is needed). `webui start --no-sandbox`
+explicitly opts out; when bwrap can't create sandboxes, `start` errors out loudly
+instead of silently downgrading.
 
 If `webui` isn't installed on this machine, `scripts/server.sh` (below) is the
 zero-dependency fallback for serving a single project.

@@ -14,8 +14,8 @@ CLI:
   webui unregister NAME
   webui list [--json]
   webui prune
-  webui start   [--port P] [--bind B] [--force]
-  webui run     [--port P] [--bind B]
+  webui start   [--port P] [--bind B] [--force] [--no-sandbox]
+  webui run     [--port P] [--bind B] [--no-sandbox]
   webui stop [--force] | webui restart [...] | webui status
   webui url NAME
   webui open NAME
@@ -248,7 +248,52 @@ def _print_log_tail(n=20):
         print("        (no log file yet)")
 
 
+def _descendant_pids(pid):
+    """All descendants of `pid` via /proc/<pid>/task/*/children. Needed
+    because bwrap 0.9.0 stays resident as the parent (it does NOT exec the
+    payload in place, even without --unshare-pid): the python daemon is a
+    grandchild of the pid Popen returned."""
+    out = []
+    queue = [pid]
+    seen = {pid}
+    while queue:
+        p = queue.pop()
+        task_dir = f'/proc/{p}/task'
+        try:
+            tasks = os.listdir(task_dir)
+        except OSError:
+            continue
+        for t in tasks:
+            try:
+                with open(os.path.join(task_dir, t, 'children'), 'r',
+                          encoding='ascii') as fh:
+                    kids = fh.read().split()
+            except OSError:
+                continue
+            for k in kids:
+                try:
+                    k = int(k)
+                except ValueError:
+                    continue
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+                    queue.append(k)
+    return out
+
+
 def _pid_listens_on_port(pid, port):
+    """True if `pid` OR any of its descendants holds a LISTENing socket on
+    `port`. The descendant walk matters under the sandbox: the socket lives
+    in the grandchild python's fd table, not bwrap's, so checking only
+    `pid` would declare every sandboxed start a failure."""
+    for p in [pid] + _descendant_pids(pid):
+        if _single_pid_listens_on_port(p, port):
+            return True
+    return False
+
+
+def _single_pid_listens_on_port(pid, port):
     """Best-effort but definitive check that `pid` itself (not some other
     process that happens to already occupy the port) holds a LISTENing
     socket on `port`, by cross-referencing /proc/net/tcp{,6} inodes against
@@ -288,6 +333,89 @@ def _pid_listens_on_port(pid, port):
         except FileNotFoundError:
             continue
     return False
+
+
+# --------------------------------------------------------------------------
+# bwrap sandbox (default-on for start/run; opt out with --no-sandbox)
+# --------------------------------------------------------------------------
+
+def _bwrap_available():
+    """(ok, reason). Probe an actual minimal sandbox, not just PATH
+    presence: on Ubuntu 24.04 the AppArmor knob
+    kernel.apparmor_restrict_unprivileged_userns=1 makes every unprivileged
+    bwrap invocation fail even though the binary is installed."""
+    bwrap = shutil.which('bwrap')
+    if not bwrap:
+        return False, "bwrap not found on PATH (install: apt install bubblewrap)"
+    try:
+        probe = subprocess.run([bwrap, '--ro-bind', '/', '/', 'true'],
+                               capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return False, "bwrap sandbox probe timed out"
+    except OSError as e:
+        return False, f"bwrap probe failed to run: {e}"
+    if probe.returncode != 0:
+        detail = (probe.stderr or '').strip().splitlines()
+        detail = detail[-1] if detail else f"exit code {probe.returncode}"
+        return False, (f"bwrap cannot create a sandbox here: {detail} "
+                       f"(check: sysctl kernel.apparmor_restrict_unprivileged_userns)")
+    return True, None
+
+
+def _sandbox_roots(registry):
+    """(roots, skipped): realpaths of registered dirs that exist, minus any
+    path already contained in another kept root (nested registrations —
+    e.g. a hub page inside another project's tree — would only shadow the
+    same source with a redundant mount). Strict per-directory policy:
+    ONLY these roots are mounted, so a registration added after daemon
+    start is invisible until 'webui restart'."""
+    skipped = []
+    candidates = []
+    for name in sorted(registry):
+        real = os.path.realpath(registry[name])
+        if os.path.isdir(real):
+            candidates.append(real)
+        else:
+            skipped.append((name, registry[name]))
+    roots = []
+    for r in sorted(set(candidates)):
+        if not any(r == k or r.startswith(k + os.sep) for k in roots):
+            roots.append(r)
+    return roots, skipped
+
+
+def _build_bwrap_argv(registry):
+    """(argv_prefix, mounted_roots, skipped) implementing the sandbox
+    profile. Deliberately NOT unshared: net (daemon needs the real
+    bind:port) and pid (as pid 1 python's default-disposition SIGTERM
+    would be ignored, degrading 'webui stop' to the SIGKILL path).
+    Residual risk accepted: shared pid ns leaves same-uid
+    /proc/<pid>/environ readable from inside.
+
+    The config dir is bound as a DIRECTORY, not registry.tsv itself:
+    write_registry() replaces the file via os.replace (new inode), and a
+    bind mount of the old inode would freeze hot-reload forever."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    roots, skipped = _sandbox_roots(registry)
+    argv = [
+        shutil.which('bwrap') or 'bwrap',
+        '--unshare-user', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup',
+        '--ro-bind', '/usr', '/usr',
+        '--symlink', 'usr/bin', '/bin',
+        '--symlink', 'usr/lib', '/lib',
+    ]
+    if os.path.isdir('/usr/lib64'):
+        argv += ['--symlink', 'usr/lib64', '/lib64']
+    argv += [
+        '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+        '--ro-bind', script_dir, script_dir,
+        '--ro-bind', config_dir(), config_dir(),
+        '--bind', state_dir(), state_dir(),
+        '--setenv', 'WEBUI_SANDBOX', '1',
+    ]
+    for r in roots:
+        argv += ['--ro-bind', r, r]
+    return argv, roots, skipped
 
 
 def get_lan_ip():
@@ -398,7 +526,16 @@ class WebuiHandler(SimpleHTTPRequestHandler):
             return False
         target_dir = registry[name]
         if not os.path.isdir(target_dir):
-            self.send_error(404, f"registered directory no longer exists: {target_dir}")
+            if os.environ.get('WEBUI_SANDBOX'):
+                # Strict per-directory binds: a dir registered after daemon
+                # start simply isn't mounted in here, which is
+                # indistinguishable from "deleted" at this point — don't
+                # emit the misleading "no longer exists" message.
+                self.send_error(404, f"'{name}' is registered but not mounted in this "
+                                     f"sandboxed daemon (registered after start?). "
+                                     f"Run 'webui restart' to pick it up.")
+            else:
+                self.send_error(404, f"registered directory no longer exists: {target_dir}")
             return False
         self._webui_root = target_dir
         return True
@@ -693,6 +830,7 @@ def cmd_register(args):
         if existing == target:
             print(f"[OK] '{name}' already registered -> {target} (no-op)")
             _maybe_build(target, args)
+            _warn_if_unmounted(name, target)
             return 0
         if not args.force:
             print(f"[ERROR] name '{name}' already registered to a different path:", file=sys.stderr)
@@ -707,7 +845,27 @@ def cmd_register(args):
     print(f"[OK] registered '{name}' -> {target}")
     print(f"     URL: /{name}/")
     _maybe_build(target, args)
+    _warn_if_unmounted(name, target)
     return 0
+
+
+def _warn_if_unmounted(name, target):
+    """Loud workflow hint for the strict per-directory sandbox policy: a
+    running sandboxed daemon only serves the roots it mounted at start, so
+    a fresh registration outside them 404s until a restart."""
+    if check_pidfile() is not True:
+        return
+    info = read_state_json() or {}
+    if not info.get('sandbox'):
+        return
+    roots = info.get('mounted_roots') or []
+    real = os.path.realpath(target)
+    if any(real == r or real.startswith(r + os.sep) for r in roots):
+        return
+    print("========================================================================")
+    print(f" ⚠️  The running daemon is SANDBOXED and does not mount this directory.")
+    print(f"    '{name}' will 404 until you run:  webui restart")
+    print("========================================================================")
 
 
 def _maybe_build(target, args):
@@ -819,12 +977,33 @@ def cmd_start(args):
         print("        Use --force to start anyway, or pick a different --port.", file=sys.stderr)
         return 1
 
+    sandbox = not args.no_sandbox
+    mounted_roots = []
+    bwrap_argv = []
+    if sandbox:
+        ok, reason = _bwrap_available()
+        if not ok:
+            print(f"[ERROR] sandbox unavailable: {reason}", file=sys.stderr)
+            print("        Refusing to silently start UNSANDBOXED. "
+                  "Re-run with --no-sandbox to explicitly opt out.", file=sys.stderr)
+            return 1
+        # config dir must exist before bwrap ro-binds it (an empty registry
+        # is fine, a missing mount source is a bwrap startup error)
+        os.makedirs(config_dir(), exist_ok=True)
+        registry = read_registry(registry_path())
+        bwrap_argv, mounted_roots, skipped = _build_bwrap_argv(registry)
+        for sk_name, sk_dir in skipped:
+            print(f"[WARN] '{sk_name}' -> {sk_dir} does not exist; not mounted in the sandbox")
+
     os.makedirs(state_dir(), exist_ok=True)
-    script = os.path.abspath(__file__)
+    # realpath, not abspath: invoked via the ~/.local/bin/webui symlink,
+    # abspath is the symlink itself, which is NOT mounted in the sandbox
+    # (only the real scripts directory is).
+    script = os.path.realpath(__file__)
     logfh = open(log_path(), 'a')
     try:
         proc = subprocess.Popen(
-            [sys.executable, script, '_serve', '--port', str(port), '--bind', bind],
+            bwrap_argv + [sys.executable, script, '_serve', '--port', str(port), '--bind', bind],
             stdin=subprocess.DEVNULL,
             stdout=logfh,
             stderr=subprocess.STDOUT,
@@ -849,6 +1028,15 @@ def cmd_start(args):
         rc = proc.poll()
         if rc is not None:
             print(f"        child process exited with code {rc}", file=sys.stderr)
+        # Kill the whole spawned group, not just proc.pid: under the
+        # sandbox the actual server is bwrap's grandchild, and even
+        # unsandboxed, returning without killing would leak a live daemon
+        # that has no pidfile pointing at it.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()  # reap; killpg alone leaves our direct child a zombie
         print(f"        Log tail ({log_path()}):", file=sys.stderr)
         _print_log_tail()
         return 1
@@ -856,6 +1044,7 @@ def cmd_start(args):
     write_pid_file(proc.pid)
     write_state_json({
         'pid': proc.pid, 'port': port, 'bind': bind,
+        'sandbox': sandbox, 'mounted_roots': mounted_roots,
         'started_at': datetime.datetime.now().isoformat(timespec='seconds'),
     })
     ip = get_lan_ip()
@@ -864,6 +1053,7 @@ def cmd_start(args):
     print(f" PID  : {proc.pid}")
     print(f" Port : {port}")
     print(f" Bind : {bind}")
+    print(f" Sandbox: {'on (bwrap, strict per-directory binds)' if sandbox else 'OFF (--no-sandbox)'}")
     print(f" URL  : http://{ip}:{port}/")
     print(f" Local: http://localhost:{port}/")
     print(f" Log  : {log_path()}")
@@ -873,15 +1063,38 @@ def cmd_start(args):
 
 def cmd_run(args):
     port, bind = args.port, args.bind
-    logger = setup_logging()
+    sandbox = not args.no_sandbox
+    if sandbox and not os.environ.get('WEBUI_SANDBOX'):
+        ok, reason = _bwrap_available()
+        if not ok:
+            print(f"[ERROR] sandbox unavailable: {reason}", file=sys.stderr)
+            print("        Refusing to silently run UNSANDBOXED. "
+                  "Re-run with --no-sandbox to explicitly opt out.", file=sys.stderr)
+            return 1
+        os.makedirs(config_dir(), exist_ok=True)
+        os.makedirs(state_dir(), exist_ok=True)
+        registry = read_registry(registry_path())
+        bwrap_argv, mounted_roots, skipped = _build_bwrap_argv(registry)
+        for sk_name, sk_dir in skipped:
+            print(f"[WARN] '{sk_name}' -> {sk_dir} does not exist; not mounted in the sandbox")
     ip = get_lan_ip()
     print("========================================================================")
     print(" 🚀 webui running in FOREGROUND (Ctrl+C to stop)")
     print(f" Port : {port}")
     print(f" Bind : {bind}")
+    print(f" Sandbox: {'on (bwrap, strict per-directory binds)' if sandbox else 'OFF (--no-sandbox)'}")
     print(f" URL  : http://{ip}:{port}/")
     print(f" Local: http://localhost:{port}/")
     print("========================================================================")
+    if sandbox and not os.environ.get('WEBUI_SANDBOX'):
+        # Replace this process with the sandboxed server: Ctrl+C's SIGINT
+        # reaches the whole foreground process group, so python's
+        # KeyboardInterrupt graceful-shutdown path still runs inside.
+        sys.stdout.flush()
+        cmd = bwrap_argv + [sys.executable, os.path.realpath(__file__), '_serve',
+                            '--port', str(port), '--bind', bind]
+        os.execv(cmd[0], cmd)
+    logger = setup_logging()
     serve_forever(port, bind, logger)
     return 0
 
@@ -908,36 +1121,42 @@ def cmd_stop(args):
         pid = int(fh.read().strip())
     print(f"[STOP] stopping webui daemon (pid {pid})...")
 
+    # Signal the PROCESS GROUP, not the single pid: the daemon is spawned
+    # with start_new_session=True so the recorded pid doubles as the pgid,
+    # and under the sandbox that pid is bwrap, which exits on SIGTERM
+    # WITHOUT forwarding it — killing only the pid would orphan the python
+    # server inside. killpg hits both; python's default SIGTERM disposition
+    # terminates it without running server_close(), so the log won't show a
+    # "shutting down" line — expected, not a crash.
     def alive():
         try:
-            os.kill(pid, 0)
+            os.killpg(pid, 0)
             return True
         except ProcessLookupError:
             return False
+        except PermissionError:
+            return True
 
-    if force:
+    def signal_group(sig):
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pid, sig)
         except ProcessLookupError:
             pass
+
+    if force:
+        signal_group(signal.SIGKILL)
         time.sleep(0.3)
         if alive():
             print(f"[ERROR] failed to stop pid {pid} (still alive after SIGKILL)", file=sys.stderr)
             return 1
     else:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        signal_group(signal.SIGTERM)
         deadline = time.time() + 5.0
         while time.time() < deadline and alive():
             time.sleep(0.2)
         if alive():
             print("[WARN] process still alive after SIGTERM, escalating to SIGKILL")
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            signal_group(signal.SIGKILL)
             time.sleep(0.5)
             if alive():
                 print(f"[ERROR] failed to stop pid {pid} (still alive after SIGKILL)", file=sys.stderr)
@@ -965,7 +1184,8 @@ def cmd_restart(args):
         (prev.get('bind', DEFAULT_BIND) if prev else DEFAULT_BIND)
     cmd_stop(argparse.Namespace(force=args.force))
     time.sleep(0.5)
-    return cmd_start(argparse.Namespace(port=port, bind=bind, force=args.force))
+    return cmd_start(argparse.Namespace(port=port, bind=bind, force=args.force,
+                                        no_sandbox=args.no_sandbox))
 
 
 def cmd_status(args):
@@ -982,6 +1202,7 @@ def cmd_status(args):
         print(f" PID  : {info.get('pid', '?')}")
         print(f" Port : {info.get('port', '?')}")
         print(f" Bind : {info.get('bind', '?')}")
+        print(f" Sandbox: {'on (bwrap)' if info.get('sandbox') else 'off'}")
         print(f" Since: {info.get('started_at', '?')}")
         print(f" URL  : http://{ip}:{info.get('port', '?')}/")
         print(f" Local: http://localhost:{info.get('port', '?')}/")
@@ -1079,11 +1300,17 @@ def build_parser():
     sp.add_argument('--port', type=int, default=DEFAULT_PORT)
     sp.add_argument('--bind', default=DEFAULT_BIND)
     sp.add_argument('--force', action='store_true', help='Skip the "port already in use" check')
+    sp.add_argument('--no-sandbox', action='store_true',
+                     help='Run without the bwrap sandbox (default: sandboxed; '
+                          'errors out if bwrap is unavailable)')
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser('run', help='Run the server in the foreground (Ctrl+C stops)')
     sp.add_argument('--port', type=int, default=DEFAULT_PORT)
     sp.add_argument('--bind', default=DEFAULT_BIND)
+    sp.add_argument('--no-sandbox', action='store_true',
+                     help='Run without the bwrap sandbox (default: sandboxed; '
+                          'errors out if bwrap is unavailable)')
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser('stop', help='Stop the daemon')
@@ -1097,6 +1324,8 @@ def build_parser():
     sp.add_argument('--bind', default=None,
                      help=f'default: whatever the running daemon was using, else {DEFAULT_BIND}')
     sp.add_argument('--force', action='store_true')
+    sp.add_argument('--no-sandbox', action='store_true',
+                     help='Restart without the bwrap sandbox')
     sp.set_defaults(func=cmd_restart)
 
     sp = sub.add_parser('status', help='Report daemon status (strictly read-only)')
